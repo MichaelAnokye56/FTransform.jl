@@ -171,3 +171,31 @@ end
 Base.length(p::Pipeline) = length(p.fs)
 Base.getindex(p::Pipeline, i) = p.fs[i]
 
+# %% ../nbs/01_transform.ipynb #3716997b
+"snake_case the (possibly CamelCase/ALLCAPS) type name `name` -- e.g. `NormalizeMean` -> `normalize_mean`, `HTTPServer` -> `http_server`."
+function camel2snake(name::AbstractString)
+    s1 = replace(name, r"([A-Z]+)([A-Z][a-z])" => s"\1_\2")
+    s2 = replace(s1, r"([a-z0-9])([A-Z])" => s"\1_\2")
+    return lowercase(s2)
+end
+
+"""
+    p.some_transform_name
+
+Access a transform contained in `p` by its [`camel2snake`](#camel2snake)'d
+type name (`p.normalize_mean` for a contained `NormalizeMean`), alongside
+`p`'s own real fields (`fs`, `split_idx`). The first match in `p.fs`
+order wins if more than one transform maps to the same name.
+"""
+function Base.getproperty(p::Pipeline, name::Symbol)
+    name in fieldnames(Pipeline) && return getfield(p, name)
+    for t in getfield(p, :fs)
+        camel2snake(string(nameof(typeof(t)))) == string(name) && return t
+    end
+    error("Pipeline has no field or contained transform named :$name")
+end
+
+function Base.propertynames(p::Pipeline, private::Bool = false)
+    (fieldnames(Pipeline)..., (Symbol(camel2snake(string(nameof(typeof(t))))) for t in p.fs)...)
+end
+
