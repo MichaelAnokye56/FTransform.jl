@@ -70,6 +70,83 @@ v = p(5)
 decode(p, v)
 ```
 
+## Transform features
+
+Beyond the quickstart above, each `Transform` can opt into a few
+independent behaviors — "independent" meaning each is its own trait
+function, freely combinable, rather than a family of subclasses to pick
+one of (see "`split_idx`/`inplace`/`itemwise` are independent traits,
+not a subclass hierarchy" below for why).
+
+### `split_idx` — gate a transform to one split
+
+Pass `split_idx` when *building* a transform to restrict it to a
+specific split (commonly 0 for train, 1 for valid — the numbering is
+entirely up to you, FTransform just compares values). Pass `split_idx`
+when *calling* a transform (or a `Pipeline`, which forwards its own
+`split_idx` to every transform it contains) to say which split is
+currently active. A mismatch makes the call a no-op passthrough; calling
+with no `split_idx` at all always runs, regardless of how the transform
+was built:
+
+```julia
+# Only ever active for split_idx == 0 ("train")
+augment = transform(x -> x * 10; split_idx = 0)
+
+augment(5; split_idx = 0)   # 50 -- matches, runs
+augment(5; split_idx = 1)   # 5  -- "valid" -- wrong split, passthrough
+augment(5)                  # 50 -- no split given, always runs
+```
+
+### `inplace` — side-effecting transforms
+
+By default, a `Transform`'s result is whatever `encodes`/`decodes` (or
+the wrapped function) returns. `inplace = true` instead discards that
+return value and hands back the *original* argument — for a transform
+whose job is a side effect (typically mutating a passed-in mutable
+container) rather than producing a replacement value:
+
+```julia
+function shift!(v)
+    v[1] += 100
+    return "ignored"  # this return value never surfaces
+end
+shifter = transform(shift!; inplace = true)
+
+arr = [1, 2, 3]
+shifter(arr)   # [101, 2, 3] -- the same, mutated array, not "ignored"
+```
+
+### `itemwise` — treat a tuple as one item
+
+By default, calling a `Transform` with a `Tuple` argument unpacks it and
+transforms each element independently (then re-packs the results as a
+tuple). `itemwise = true` instead passes the whole tuple to the wrapped
+function as a single, opaque argument:
+
+```julia
+default_add = transform(x -> x + 1)
+default_add((1, 2))    # (2, 3) -- each element incremented independently
+
+sum_pair = transform(t -> (t[1] + t[2], 0); itemwise = true)
+sum_pair((1, 2))        # (3, 0) -- the whole tuple handled at once
+```
+
+### Accessing a `Pipeline`'s contained transforms by name
+
+A `Pipeline` auto-exposes each contained transform under a
+`camel2snake`'d attribute built from its type name — matching
+fasttransform's own Python-reflection convenience (ported here via
+`Base.getproperty` overloading). The real fields (`fs`, `split_idx`)
+still resolve normally:
+
+```julia
+p = Pipeline([t2, normalize])   # normalize :: NormalizeMean
+
+p.normalize_mean === normalize  # true -- found by snake-cased type name
+p.fs                            # the real underlying field still works
+```
+
 ## Design notes (Julia-specific — see `ARCHITECTURE.md` for the full reasoning)
 
 - **Where Julia wins**: fasttransform's `_TfmMeta`/`_TfmDict` metaclass
