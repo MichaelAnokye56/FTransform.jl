@@ -72,12 +72,30 @@ end
     retain_type(new, old=nothing; ret_type::Union{Nothing,Type}=nothing)
 
 Cast `new` to `ret_type` if given, or to `old`'s own type if `old`'s type
-could plausibly have produced `new` (checked via `hasmethod(convert,
-...)`, not `isa` — a Julia wrapper type like a custom `Real` subtype
-is never an `isa` match for the plain numeric type it wraps the way a
-real Python subclass would be, but it *can* `convert` to/from it, which
-is the signal that actually carries over). No conversion if
-`ret_type === Nothing` or `new === nothing`.
+could plausibly have produced `new`. No conversion if `ret_type ===
+Nothing` or `new === nothing`.
+
+The "plausibly produced" check took two tries to get right, both
+confirmed empirically rather than assumed:
+
+1. `hasmethod(convert, (typeof(old), typeof(new)))`, not `isa` — a Julia
+   wrapper type like a custom `Real` subtype is never an `isa` match for
+   the plain numeric type it wraps the way a real Python subclass would
+   be, but it *can* `convert` to/from it, which is the signal that
+   actually carries the right semantics over.
+2. That alone is *too* permissive for Julia's own built-in numeric tower:
+   `Int` and `Float64` can always `convert` between each other (ordinary
+   promotion), so a `Pipeline` step that naturally widens an `Int` input
+   to a `Float64` result would otherwise get incorrectly forced back to
+   `Int` — confirmed empirically to throw `InexactError` the moment the
+   value isn't a whole number. Fixed by special-casing: if both types are
+   `Number`s and Julia's own `promote_type` already settles on `new`'s
+   type as the natural common type (ordinary widening, no custom
+   `promote_rule` involved), leave `new` alone — `promote_type` for a
+   genuine wrapper type with no defined `promote_rule` falls back to a
+   shared *abstract* supertype instead (confirmed: `promote_type(FS2,
+   Float64) == Real`, not `Float64`), so this doesn't affect the wrapper
+   case at all.
 """
 function retain_type(new, old=nothing; ret_type::Union{Nothing,Type}=nothing)
     new === nothing && return new
@@ -85,6 +103,9 @@ function retain_type(new, old=nothing; ret_type::Union{Nothing,Type}=nothing)
     if ret_type === nothing
         old === nothing && return new
         rt = old isa Type ? old : typeof(old)
+        if rt <: Number && typeof(new) <: Number && promote_type(rt, typeof(new)) == typeof(new)
+            return new
+        end
         hasmethod(convert, Tuple{Type{rt},typeof(new)}) || return new
         ret_type = rt
     end
