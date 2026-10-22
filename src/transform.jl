@@ -40,25 +40,39 @@ order(t::Transform) = 0
 "Does `t`'s call wrapper auto-preserve/restore the input's runtime type on the result (see the module docstring)? Default `true`."
 autoretain(t::Transform) = true
 
+"Which split (e.g. train vs valid, however the caller numbers them) `t` is active for. `nothing` (the default) means always active, regardless of the `split_idx` a caller passes when calling `t`."
+split_idx_of(t::Transform) = nothing
+
+"Does `t` discard `encodes`/`decodes`'s own return value and return the original argument instead — for a transform whose job is a side effect (e.g. mutating a passed-in array in place) rather than producing a replacement value? Default `false`."
+inplace(t::Transform) = false
+
+"Does `t` treat a `Tuple` argument as one opaque item (passed to `encodes`/`decodes` as-is), rather than the default of unpacking it and transforming each element independently? Default `false`."
+itemwise(t::Transform) = false
+
 # %% ../nbs/01_transform.ipynb #964b54b7
 _is_tuple(x) = x isa Tuple
 
-function _apply(f::Function, t::Transform, x)
-    if _is_tuple(x)
-        y = Tuple(_apply(f, t, xi) for xi in x)
+function _apply(f::Function, t::Transform, x; split_idx = nothing)
+    own = split_idx_of(t)
+    (own !== nothing && split_idx !== nothing && split_idx != own) && return x
+    if _is_tuple(x) && !itemwise(t)
+        y = Tuple(_apply(f, t, xi; split_idx = split_idx) for xi in x)
         return retain_type(y, x)
     end
     y = f(t, x)
+    inplace(t) && return x
     return autoretain(t) ? retain_type(y, x) : y
 end
 
-"Calling a `Transform` applies [`encodes`](#encodes)."
-(t::Transform)(x) = _apply(encodes, t, x)
+"Calling a `Transform` applies [`encodes`](#encodes). Pass `split_idx` to match against `t`'s own [`split_idx_of`](#split_idx_of) — a mismatch makes the call a no-op passthrough."
+(t::Transform)(x; split_idx = nothing) = _apply(encodes, t, x; split_idx = split_idx)
 
-"    decode(t, x)
+"""
+    decode(t, x; split_idx=nothing)
 
-Apply [`decodes`](#decodes) to `x`, undoing `t`'s forward transform."
-decode(t::Transform, x) = _apply(decodes, t, x)
+Apply [`decodes`](#decodes) to `x`, undoing `t`'s forward transform.
+"""
+decode(t::Transform, x; split_idx = nothing) = _apply(decodes, t, x; split_idx = split_idx)
 
 """
     setup!(t, items=nothing)
@@ -77,24 +91,31 @@ struct FuncTransform <: Transform
     dec::Union{Nothing,Function}
     ord::Int
     retain::Bool
+    splitidx::Union{Nothing,Int}
+    doinplace::Bool
+    itemwise::Bool
 end
 
 """
-    transform(enc=nothing; dec=nothing, order=0, autoretain=true)
+    transform(enc=nothing; dec=nothing, order=0, autoretain=true, split_idx=nothing, inplace=false, itemwise=false)
 
 Wrap plain function(s) as a [`Transform`](#Transform). `enc`/`dec` can be
 `nothing` (passthrough) or any callable — including an already-`Transform`
 wrapped one, in which case it's used as-is (matching fasttransform's own
 "already a Transform? leave it alone" rule in `mk_transform`).
 """
-function transform(enc = nothing; dec = nothing, order::Int = 0, autoretain::Bool = true)
-    FuncTransform(enc, dec, order, autoretain)
+function transform(enc = nothing; dec = nothing, order::Int = 0, autoretain::Bool = true,
+                    split_idx::Union{Nothing,Int} = nothing, inplace::Bool = false, itemwise::Bool = false)
+    FuncTransform(enc, dec, order, autoretain, split_idx, inplace, itemwise)
 end
 
 encodes(t::FuncTransform, x) = (t.enc === nothing || !applicable(t.enc, x)) ? x : t.enc(x)
 decodes(t::FuncTransform, x) = (t.dec === nothing || !applicable(t.dec, x)) ? x : t.dec(x)
 order(t::FuncTransform) = t.ord
 autoretain(t::FuncTransform) = t.retain
+split_idx_of(t::FuncTransform) = t.splitidx
+inplace(t::FuncTransform) = t.doinplace
+itemwise(t::FuncTransform) = t.itemwise
 
 "Already a `Transform`? Use it as-is. A plain function? Wrap it with [`transform`](#transform)."
 mk_transform(t::Transform) = t
@@ -104,23 +125,26 @@ mk_transform(f) = transform(f)
 "A sequence of `Transform`s, applied in order (and undone in reverse order by [`decode`](#decode))."
 struct Pipeline
     fs::Vector{Transform}
+    split_idx::Union{Nothing,Int}
 end
 
 """
-    Pipeline(fs=Transform[])
+    Pipeline(fs=Transform[]; split_idx=nothing)
 
 Build a `Pipeline` from a collection of transforms (plain functions are
 wrapped via [`mk_transform`](#mk_transform)), sorted by [`order`](#order).
+`split_idx`, if given, is passed to every contained transform's call —
+see [`split_idx_of`](#split_idx_of).
 """
-function Pipeline(fs::AbstractVector = Transform[])
+function Pipeline(fs::AbstractVector = Transform[]; split_idx::Union{Nothing,Int} = nothing)
     fs isa Pipeline && return fs
     ts = Transform[mk_transform(f) for f in fs]
     sort!(ts; by = order)
-    return Pipeline(ts)
+    return Pipeline(ts, split_idx)
 end
 
-(p::Pipeline)(x) = foldl((acc, t) -> t(acc), p.fs; init = x)
-decode(p::Pipeline, x) = foldl((acc, t) -> decode(t, acc), reverse(p.fs); init = x)
+(p::Pipeline)(x) = foldl((acc, t) -> t(acc; split_idx = p.split_idx), p.fs; init = x)
+decode(p::Pipeline, x) = foldl((acc, t) -> decode(t, acc; split_idx = p.split_idx), reverse(p.fs); init = x)
 
 "Run [`setup!`](#setup!) on every transform in `p`, in order, each from the same `items`."
 function setup!(p::Pipeline, items = nothing)
