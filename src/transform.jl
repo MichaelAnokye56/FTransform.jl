@@ -68,9 +68,21 @@ tuple type as a whole).
 """
 function _apply(f::Function, t::Transform, x; split_idx = nothing)
     own = split_idx_of(t)
-    (own !== nothing && split_idx !== nothing && split_idx != own) && return x
+    # isequal, not != : a bare != forces three-valued missing-propagation into
+    # a boolean context the moment either side is `missing` (a very plausible
+    # real value here, e.g. piped in from a DataFrame column) -- found live.
+    (own !== nothing && split_idx !== nothing && !isequal(split_idx, own)) && return x
     if _is_tuple(x) && !itemwise(t)
         y = Tuple(_apply(f, t, xi; split_idx = split_idx) for xi in x)
+        # inplace must be checked here too, not just in the scalar branch below:
+        # each element already preserved its own identity via the recursive
+        # _apply call, but re-packing them into a *new* tuple `y` and then
+        # calling retain_types on it unconditionally rebuilds that tuple (and
+        # recurses into any listy element inside it) regardless of whether
+        # anything actually needs restoring -- silently breaking inplace's
+        # "hand back the original argument" contract the moment a mutated
+        # array is nested one level inside a tuple. Found live.
+        inplace(t) && return x
         return autoretain(t) ? retain_types(y, x) : y
     end
     y = f(t, x)
@@ -101,8 +113,8 @@ end
 # %% ../nbs/01_transform.ipynb #d8c96f55
 "A `Transform` built from a plain function (or a pair, for a reversible one), rather than a `Transform` subtype's own methods."
 struct FuncTransform <: Transform
-    enc::Union{Nothing,Function}
-    dec::Union{Nothing,Function}
+    enc::Any
+    dec::Any
     ord::Int
     retain::Bool
     splitidx::Union{Nothing,Int}
@@ -120,6 +132,13 @@ wrapped one, in which case it's used as-is (matching fasttransform's own
 """
 function transform(enc = nothing; dec = nothing, order::Int = 0, autoretain::Bool = true,
                     split_idx::Union{Nothing,Int} = nothing, inplace::Bool = false, itemwise::Bool = false)
+    enc isa Type{<:Transform} &&
+        error("transform: got the type `$enc`, not an instance -- did you mean `$(enc)()`?")
+    dec isa Type{<:Transform} &&
+        error("transform: got the type `$dec` for `dec`, not an instance -- did you mean `$(dec)()`?")
+    if enc isa Transform && dec === nothing
+        return enc
+    end
     FuncTransform(enc, dec, order, autoretain, split_idx, inplace, itemwise)
 end
 
@@ -134,6 +153,19 @@ itemwise(t::FuncTransform) = t.itemwise
 "Already a `Transform`? Use it as-is. A plain function? Wrap it with [`transform`](#transform)."
 mk_transform(t::Transform) = t
 mk_transform(f) = transform(f)
+
+"""
+    mk_transform(T::Type{<:Transform})
+
+A clearer error for the easy mistake of passing a `Transform` *type*
+(e.g. to [`Pipeline`](#Pipeline)) instead of an instance. `transform`
+has the identical guard built in directly (so this case is caught
+before `mk_transform`'s own generic `mk_transform(f) = transform(f)`
+fallback would otherwise construct a nonsensical `FuncTransform`
+wrapping the type itself as `enc`).
+"""
+mk_transform(T::Type{<:Transform}) =
+    error("mk_transform: got the type `$T`, not an instance -- did you mean `$(T)()`?")
 
 # %% ../nbs/01_transform.ipynb #af2c9127
 "A sequence of `Transform`s, applied in order (and undone in reverse order by [`decode`](#decode))."
@@ -153,7 +185,12 @@ see [`split_idx_of`](#split_idx_of).
 function Pipeline(fs::AbstractVector = Transform[]; split_idx::Union{Nothing,Int} = nothing)
     fs isa Pipeline && return fs
     ts = Transform[mk_transform(f) for f in fs]
-    sort!(ts; by = order)
+    # alg=MergeSort, not the bare default: Julia's default sort has no
+    # stability guarantee for equal keys, and every transform defaults to
+    # the same order (0) -- the documented "first in p.fs order wins" rule
+    # for a name collision silently depended on an implementation detail
+    # Julia itself labels unstable. Found live.
+    sort!(ts; by = order, alg = Base.Sort.MergeSort)
     return Pipeline(ts, split_idx)
 end
 
@@ -178,12 +215,20 @@ function add!(p::Pipeline, t, items = nothing)
     tfm = mk_transform(t)
     setup!(tfm, items)
     push!(p.fs, tfm)
-    sort!(p.fs; by = order)
+    sort!(p.fs; by = order, alg = Base.Sort.MergeSort)
     return p
 end
 
 Base.length(p::Pipeline) = length(p.fs)
 Base.getindex(p::Pipeline, i) = p.fs[i]
+"""
+`Pipeline` has `length`/`getindex` but didn't have `iterate` -- it looked
+like a sized, indexable collection without actually being an iterable
+one (`for t in p`/`collect(p)`/`first(p)` all threw `MethodError: no
+method matching iterate`, with unhelpful "closest candidates" pointing
+at unrelated Base internals). Found live.
+"""
+Base.iterate(p::Pipeline, i::Int = 1) = i > length(p) ? nothing : (p[i], i + 1)
 
 # %% ../nbs/01_transform.ipynb #3716997b
 "snake_case the (possibly CamelCase/ALLCAPS) type name `name` -- e.g. `NormalizeMean` -> `normalize_mean`, `HTTPServer` -> `http_server`."
@@ -210,6 +255,21 @@ function Base.getproperty(p::Pipeline, name::Symbol)
 end
 
 function Base.propertynames(p::Pipeline, private::Bool = false)
-    (fieldnames(Pipeline)..., (Symbol(camel2snake(string(nameof(typeof(t))))) for t in p.fs)...)
+    names = Symbol[fieldnames(Pipeline)...]
+    # Dedup, keeping the first occurrence: two contained transforms can
+    # camel2snake to the same name (two instances of the same type is the
+    # most common way, but a type literally named `Fs`/`SplitIdx` collides
+    # with Pipeline's own real fields the same way). Without dedup,
+    # propertynames previously listed a name once per *contained
+    # transform* that maps to it, including ones getproperty will never
+    # actually return (it always finds the *first* match) -- so pairing
+    # propertynames(p) with p.fs element-by-element, a natural thing to
+    # try for introspection/display, silently associated names with the
+    # wrong transform. Found live.
+    for t in p.fs
+        nm = Symbol(camel2snake(string(nameof(typeof(t)))))
+        nm in names || push!(names, nm)
+    end
+    return Tuple(names)
 end
 

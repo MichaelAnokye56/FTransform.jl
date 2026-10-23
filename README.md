@@ -70,6 +70,76 @@ v = p(5)
 decode(p, v)
 ```
 
+## The import-vs-using gotcha (read this first)
+
+Plain `using FTransform` brings every exported name into scope for
+*calling*, but doesn't let you *add a method* to one of them — Julia
+creates a brand-new, disconnected local function with the same name
+instead. General Julia behavior (the same reason you're taught to write
+`Base.show(io, x::T) = ...`, not a bare `show(io, x::T) = ...`, after
+`using Base`), not a bug — but it's sharp here specifically because
+defining your own methods is this package's central usage pattern. Fix:
+`import` every name you intend to add a method to, before defining it:
+
+```julia
+using FTransform
+import FTransform: encodes, decodes, setups!, order, autoretain, split_idx_of, inplace, itemwise
+```
+
+That's the full list — not just `encodes`/`decodes`/`setups!`. Overriding
+any of `order`/`autoretain`/`split_idx_of`/`inplace`/`itemwise` on your
+own `Transform` subtype (exactly what "Design notes" below tells you to
+do) needs the identical `import` — confirmed to silently shadow the same
+way if you skip it.
+
+**The failure mode is not always silent.** It depends on what else
+happens to be in scope:
+
+- Usually: your method is silently never called; the library's default
+  (passthrough, `order=0`, etc.) runs instead, with no error at all.
+- If the shadowed name is later called elsewhere expecting the
+  *library's* own methods — most plausibly `transform` itself — you
+  instead get a confusing `MethodError` that gives no hint the real
+  cause is a missing `import`.
+
+Two more names reach beyond the obvious list above:
+
+- **`transform()` itself.** It's meant to be called, not extended — but
+  the shadowing mechanism is purely name-based, not role-based. Defining
+  *any* unqualified method for `transform` (even for a type that has
+  nothing to do with this package) converts the whole function into a
+  near-empty one, breaking every other call to `transform()` in that
+  module with a `MethodError` that doesn't look related at all.
+- **`camel2snake`**, used internally by `Pipeline`'s
+  `getproperty`/`propertynames`. An unqualified override "works" when
+  called directly — the shadow is fully functional in isolation — while
+  `Pipeline` silently keeps using the real one underneath, ignoring your
+  override entirely with no error.
+
+**A second, different mechanism — naming collisions, not method
+shadowing.** Naming your own `Transform` subtype the same as an existing
+FTransform export (`Pipeline` is an easy, generic name to reach for) also
+silently shadows, but via Julia's *type* binding rather than a generic
+function's method table: `struct Pipeline <: Transform end` after `using
+FTransform` succeeds with no error at definition time, and the real
+`Pipeline([...])` constructor call then fails with a `MethodError` that
+gives no indication the cause is a name collision with the package.
+`FTransform.Pipeline(...)`, fully qualified, works around it.
+
+**A genuinely dangerous half-working state.** Importing only *some* of a
+transform's needed names (`encodes` but forgetting `decodes`, say)
+extends the one you imported correctly and silently shadows the other —
+`encodes` looks completely correct, `decodes` looks like it works (no
+error, just wrong), and only an explicit round-trip check (`decode(t,
+t(x)) == x`) reveals the break.
+
+**A `Pipeline`-specific adjacent footgun**, same silent character but a
+different cause: a `Transform` subtype named `Fs` or `SplitIdx` (whose
+`camel2snake`'d name collides with `Pipeline`'s own two real fields) is
+*never* reachable by name through `p.fs`/`p.split_idx` — `getproperty`
+checks real fields first, unconditionally, so the contained transform is
+permanently shadowed with no warning regardless of `import`.
+
 ## Transform features
 
 Beyond the quickstart above, each `Transform` can opt into a few
@@ -160,15 +230,9 @@ p.fs                            # the real underlying field still works
   Julia value's concrete type is fixed forever once constructed, so
   `cast` here always builds a new value via the target type's own
   constructor.
-- **A Julia gotcha, not a port decision**: defining your own
-  `encodes`/`decodes`/`setups!` method for a new `Transform` subtype
-  needs `import FTransform: encodes, decodes, setups!` first (or fully
-  qualifying as `FTransform.encodes(...)  = ...`) — plain `using
-  FTransform` brings those names into scope for *calling*, but a bare
-  `encodes(t::MyType, x) = ...` after that silently creates a brand new,
-  separate local function instead of adding a dispatch method to the
-  real one, with no error or warning. Easy to miss, since the failure
-  mode is silent (your method is just never called) rather than loud.
+- **A Julia gotcha, not a port decision**: see "The import-vs-using
+  gotcha" above — it's load-bearing enough to earn its own section
+  rather than a Design notes bullet.
 - **`split_idx`/`inplace`/`itemwise` are independent traits, not a
   subclass hierarchy**: fasttransform has `InplaceTransform` and
   `ItemTransform` as separate base classes (pick at most one via single
@@ -177,6 +241,35 @@ p.fs                            # the real underlying field still works
   it needs, freely combinable. `DisplayedTransform` needs no port at all
   — overriding `Base.show` already does that job for any Julia type.
 
+## Known limitations
+
+Found during an adversarial stress test, confirmed empirically, and left
+as documented behavior rather than code-fixed — see
+`fasttransform_files/ARCHITECTURE.md`'s "An 11-agent adversarial stress
+test" section for the full detail and why each one is harder to fix than
+it looks:
+
+- `has_meta`/`get_meta`/`set_meta!` only restore automatically through a
+  `Transform`'s call (not just via calling `retain_meta` directly) for a
+  type that explicitly defines `Base.convert` to it — a `Number` subtype
+  gets this for free, an ordinary `struct` does not, even with its own
+  outer constructor.
+- A custom `Number` subtype that defines its own `promote_rule` (for
+  ordinary arithmetic, unrelated to this package) silently loses
+  automatic type-preservation against whichever type that rule targets.
+- Define your own `encodes`/`decodes`/`setups!`/trait-function methods
+  on your own `Transform` subtype, never on the abstract `Transform` type
+  itself — doing so applies globally and can hit a genuine Julia dispatch
+  ambiguity against `FuncTransform`.
+- `add!`/`setup!` called with `items=nothing` against a transform whose
+  `setups!` needs real data fails with whatever unhelpful error the
+  user's own `setups!` body happens to produce.
+- A non-`Bool` trait-function override fails with a generic `TypeError`
+  that doesn't mention FTransform or the actual override responsible.
+- Pathologically deep nested-tuple inputs (100+ levels) cause
+  catastrophic compile-time slowdown, not a clean error — avoid passing
+  deeply-nested tuple structures through a `Transform`/`Pipeline`.
+
 ## Status
 
 Ported directly from the real `AnswerDotAI/fasttransform` source
@@ -184,6 +277,12 @@ Ported directly from the real `AnswerDotAI/fasttransform` source
 example above is a real test, run via `Pkg.test()` (which runs every
 notebook under `nbs/` through
 [NBDev](https://github.com/MichaelAnokye56/NBDev.jl)'s `test_project()`).
+Stress-tested by 11 independent agents trying to break it from different
+angles (core mechanics, every trait, malformed input, a from-scratch
+realistic usage scenario, and a line-by-line re-run of every doc example)
+before this release — see "Known limitations" above and
+`fasttransform_files/ARCHITECTURE.md` for everything that was found and
+fixed.
 
 ## Releasing
 

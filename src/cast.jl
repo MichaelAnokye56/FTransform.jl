@@ -102,7 +102,11 @@ function retain_type(new, old=nothing; ret_type::Union{Nothing,Type}=nothing)
     ret_type === Nothing && return new
     if ret_type === nothing
         old === nothing && return new
+        if new isa Tuple && old isa Tuple
+            return retain_types(new, old)
+        end
         rt = old isa Type ? old : typeof(old)
+        (rt === Missing || rt === Nothing) && return new
         if rt <: Number && typeof(new) <: Number && promote_type(rt, typeof(new)) == typeof(new)
             return new
         end
@@ -126,13 +130,16 @@ container kind (a `Tuple` stays a `Tuple`, matching Python's own
 `Tuple`+`Vector` mix degrades to a `Vector`, silently losing that).
 Falls back to plain [`retain_type`](#retain_type) for a non-listy `new`.
 """
+_cycle_to(v, n) = isempty(v) ? fill(nothing, n) : (length(v) == n ? v : [v[mod1(i, length(v))] for i in 1:n])
+
 function retain_types(new, old=nothing, typs=nothing)
     if !_is_listy(new)
         return retain_type(new, old; ret_type = typs)
     end
-    oldv = old === nothing ? fill(nothing, length(new)) : old
-    typsv = typs === nothing ? fill(nothing, length(new)) : typs
-    mapped = [retain_types(n, o, t) for (n, o, t) in zip(new, oldv, typsv)]
+    n = length(new)
+    oldv = old === nothing ? fill(nothing, n) : _cycle_to(old, n)
+    typsv = typs === nothing ? fill(nothing, n) : _cycle_to(typs, n)
+    mapped = [retain_types(ni, oi, ti) for (ni, oi, ti) in zip(new, oldv, typsv)]
     return new isa Tuple ? Tuple(mapped) : mapped
 end
 
