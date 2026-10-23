@@ -52,12 +52,26 @@ itemwise(t::Transform) = false
 # %% ../nbs/01_transform.ipynb #964b54b7
 _is_tuple(x) = x isa Tuple
 
+"""
+Tuple elements are restored via [`retain_types`](#retain_types) (per-element),
+not [`retain_type`](#retain_type) (whole-tuple) -- found live by a user
+building a two-field dispatch example: `retain_type` tries to `convert`
+the *entire* result tuple to the *entire* original tuple's type in one
+shot, and Julia's generic Tuple-to-Tuple `convert` machinery makes
+`hasmethod` say yes to almost any such pair -- even when the individual
+*element* types have no real conversion path between them, which then
+fails at runtime with a confusing `MethodError` instead of just leaving
+the elements alone (`retain_types`' own per-element guard correctly
+says no in that case, since it's the same `hasmethod` check
+`retain_type` itself uses, just applied per-element instead of to the
+tuple type as a whole).
+"""
 function _apply(f::Function, t::Transform, x; split_idx = nothing)
     own = split_idx_of(t)
     (own !== nothing && split_idx !== nothing && split_idx != own) && return x
     if _is_tuple(x) && !itemwise(t)
         y = Tuple(_apply(f, t, xi; split_idx = split_idx) for xi in x)
-        return retain_type(y, x)
+        return autoretain(t) ? retain_types(y, x) : y
     end
     y = f(t, x)
     inplace(t) && return x
